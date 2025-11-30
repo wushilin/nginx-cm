@@ -4,6 +4,29 @@ This project provides a centralized configuration management system for Nginx re
 
 These tools use AWS S3 (or compatible object storage) as a synchronization medium, allowing for a decoupled architecture where the control plane (`nginx-cm`) does not need direct network access to the data plane (`ngguard` running on Nginx servers).
 
+## Nginx Template variables
+<img width="908" height="474" alt="image" src="https://github.com/user-attachments/assets/9a0f9986-e1db-4793-9468-9c538c8dc5db" />
+
+## ngguard parameter customization
+<img width="903" height="379" alt="image" src="https://github.com/user-attachments/assets/35ad279a-9607-493d-b960-5244ce7ec27b" />
+
+## Listener configs
+<img width="898" height="794" alt="image" src="https://github.com/user-attachments/assets/4a928562-c66f-4a1b-9556-21ee180baf3d" />
+
+## Config preview and local test capability
+<img width="907" height="637" alt="image" src="https://github.com/user-attachments/assets/c9b05f75-e36c-4530-b108-3c2711e03cbb" />
+
+## Deploy status watching: You can see which nodes had loaded successfully, and which one has not loaded
+<img width="914" height="226" alt="image" src="https://github.com/user-attachments/assets/342106f1-4e1c-45ff-82f0-5246944ca223" />
+
+## Some nodes failed
+<img width="910" height="239" alt="image" src="https://github.com/user-attachments/assets/299eb449-1c54-418c-9228-55bc3742132b" />
+
+## View failure reason
+<img width="915" height="416" alt="image" src="https://github.com/user-attachments/assets/2104c04c-876e-4e5d-9d72-ee9ca5856b33" />
+
+
+
 ## Components
 
 ### 1. nginx-cm (Configuration Manager)
