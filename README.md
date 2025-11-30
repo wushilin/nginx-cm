@@ -27,11 +27,13 @@ These tools use AWS S3 (or compatible object storage) as a synchronization mediu
 
 
 
-## Components
+# Components
+
+## This service will cost you about 0.3 USD per month for a 3 node nginx TLS proxy guardian. Mainly paying for the object gets. Storage s almost 0 cost.
 
 ### 1. nginx-cm (Configuration Manager)
 
-A web-based control plane to manage Nginx configurations.
+A web-based control plane to manage Nginx configurations. You may want to run it elsewhere, your local machine, a kubernetes statefulset with 10M space persistent storage (single node, no HA).
 
 **Features:**
 - **Web Interface:** Easy-to-use UI to manage Listeners and SNI Mappings.
@@ -46,6 +48,7 @@ A web-based control plane to manage Nginx configurations.
 ./nginx-cm --config s3_config.json
 
 # Or run with Environment Variables
+export S3_ENDPOINT=https://xxxxx
 export S3_BUCKET=my-bucket
 export S3_ACCESS_KEY=...
 export S3_SECRET_KEY=...
@@ -54,7 +57,8 @@ export S3_SECRET_KEY=...
 
 ### 2. ngguard (Guardian)
 
-An agent that runs alongside Nginx on your edge/proxy servers.
+An agent that runs alongside Nginx on your edge/proxy servers. This should be built with a docker image or something. this is the master process that controls nginx process.
+It is watch guardian, or control process that mainly react to config changes.
 
 **Features:**
 - **Automatic Updates:** Polls S3 for configuration changes.
@@ -70,6 +74,7 @@ An agent that runs alongside Nginx on your edge/proxy servers.
 
 # Or run with Environment Variables
 export S3_BUCKET=my-bucket
+export S3_ENDPOINT=https://xxxxx
 export S3_ACCESS_KEY=...
 export S3_SECRET_KEY=...
 ./ngguard
