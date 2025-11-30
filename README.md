@@ -4,6 +4,8 @@ This project provides a centralized configuration management system for Nginx re
 
 These tools use AWS S3 (or compatible object storage) as a synchronization medium, allowing for a decoupled architecture where the control plane (`nginx-cm`) does not need direct network access to the data plane (`ngguard` running on Nginx servers).
 
+Ony allowed SNI is accepted. You can allow all using a `.*` regex for all SNI, of course!
+
 ## Nginx Template variables
 <img width="908" height="474" alt="image" src="https://github.com/user-attachments/assets/9a0f9986-e1db-4793-9468-9c538c8dc5db" />
 
