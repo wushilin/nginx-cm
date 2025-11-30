@@ -1,0 +1,54 @@
+user {{ user }};
+load_module {{ stream_module_path }};
+error_log ./error.log;
+worker_processes 1;
+daemon off;
+
+events {
+        worker_connections 25600;
+        multi_accept on;
+}
+
+stream {
+    {%- if resolver and resolver != "" %}
+    resolver {{ resolver }} valid=30s;
+    {%- endif %}
+    map_hash_bucket_size 128;
+
+    {%- for listener in listeners %}
+    # Whitelist map for {{ listener.bind }}:{{ listener.port }}
+    map $ssl_preread_server_name $backend_host_{{ listener.bind | replace(from=".", to="_") | replace(from=":", to="_") }}_{{ listener.port }} {
+        {%- for mapping in listener.mappings %}
+        {%- if mapping.target and mapping.target != "" %}
+            {%- if mapping.target is matching(":[0-9]+$") %}
+        ~*{{ mapping.pattern }} {{ mapping.target }};
+            {%- else %}
+        ~*{{ mapping.pattern }} {{ mapping.target }}:{{ listener.port }};
+            {%- endif %}
+        {%- else %}
+        ~*{{ mapping.pattern }} $ssl_preread_server_name:{{ listener.port }};
+        {%- endif %}
+        {%- endfor %}
+        default ""; # Reject unknown hostnames
+    }
+    {%- endfor %}
+
+    {%- for listener in listeners %}
+    log_format proxy_{{ listener.bind | replace(from=".", to="_") | replace(from=":", to="_") }}_{{ listener.port }} '$remote_addr [$time_local] '
+                     '"$protocol" $status $bytes_sent $bytes_received '
+                     '"$upstream_addr" "$upstream_bytes_sent" "$upstream_bytes_received" '
+                     'mapped_host="$backend_host_{{ listener.bind | replace(from=".", to="_") | replace(from=":", to="_") }}_{{ listener.port }}"';
+
+    server {
+        listen {{ listener.bind }}:{{ listener.port }};
+
+        # Required for inspecting SNI
+        ssl_preread on;
+        
+        # Use the specific log format for this port
+        access_log ./access.log proxy_{{ listener.bind | replace(from=".", to="_") | replace(from=":", to="_") }}_{{ listener.port }};
+
+        proxy_pass $backend_host_{{ listener.bind | replace(from=".", to="_") | replace(from=":", to="_") }}_{{ listener.port }};
+    }
+    {%- endfor %}
+}
