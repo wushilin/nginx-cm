@@ -5,4 +5,4 @@ export S3_ACCESS_KEY=xNC3m3dHmh5e3Y421X06
 export S3_SECRET_KEY=sJ07BMP1qoxGxL9wjeAnuDBjK7gmvBSZF3p9H2gG
 
 
-target/debug/ngguard --config ngs3.json
+target/release/ngguard --config ngs3.json
