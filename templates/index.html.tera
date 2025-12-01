@@ -138,6 +138,11 @@
                                     <label for="nginx_working_dir" class="form-label">Nginx Working Directory</label>
                                     <input type="text" class="form-control" id="nginx_working_dir" name="nginx_working_dir" value="{{ nginx_working_dir }}" required>
                                 </div>
+                                <div class="col-12">
+                                    <label for="heartbeat_interval_minutes" class="form-label">Heartbeat Interval (Minutes)</label>
+                                    <input type="number" class="form-control" id="heartbeat_interval_minutes" name="heartbeat_interval_minutes" value="{{ heartbeat_interval_minutes }}" min="1" required>
+                                    <div class="form-text">How often the agent sends status updates. Warning/Down thresholds are based on this (3x and 6x).</div>
+                                </div>
                                 <div class="col-12 text-end mt-3">
                                     <button type="submit" class="btn btn-primary">Update Guardian Config</button>
                                 </div>
@@ -255,96 +260,166 @@
                 </div>
             </div>
 
-            <!-- Tab 5: NGGuard Load status page -->
+            <!-- Tab 5: Status Page -->
             <div class="tab-pane fade" id="status" role="tabpanel" aria-labelledby="status-tab">
-                <div class="card mb-4 border-primary">
-                    <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+                
+                <!-- Legend Card -->
+                <div class="card mb-4">
+                    <div class="card-header bg-light">
+                        <h3 class="h6 mb-0">Status Legend</h3>
+                    </div>
+                    <div class="card-body">
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <h6 class="small text-uppercase text-muted fw-bold">Agent Health</h6>
+                                <ul class="list-unstyled small mb-0">
+                                    <li class="mb-1">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-activity text-success me-1" viewBox="0 0 16 16"><path fill-rule="evenodd" d="M6 2a.5.5 0 0 1 .47.33L10 12.036l1.53-4.208A.5.5 0 0 1 12 7.5h3.5a.5.5 0 0 1 0 1h-3.15l-1.88 5.17a.5.5 0 0 1-.94 0L6 3.964 4.47 8.171A.5.5 0 0 1 4 8.5H.5a.5.5 0 0 1 0-1h3.15l1.88-5.17A.5.5 0 0 1 6 2Z"/></svg>
+                                        <strong>Agent OK:</strong> Seen within 3x heartbeat interval.
+                                    </li>
+                                    <li class="mb-1">
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-exclamation-triangle-fill text-warning me-1" viewBox="0 0 16 16"><path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/></svg>
+                                        <strong>Agent might be down:</strong> Seen between 3x and 6x heartbeat interval.
+                                    </li>
+                                    <li>
+                                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-x-octagon-fill text-danger me-1" viewBox="0 0 16 16"><path d="M11.46.146A.5.5 0 0 0 11.107 0H4.893a.5.5 0 0 0-.353.146L.146 4.54A.5.5 0 0 0 0 4.893v6.214a.5.5 0 0 0 .146.353l4.394 4.394a.5.5 0 0 0 .353.146h6.214a.5.5 0 0 0 .353-.146l4.394-4.394a.5.5 0 0 0 .146-.353V4.893a.5.5 0 0 0-.146-.353L11.46.146zm-6.132 5.146a.5.5 0 1 1 .707-.708l2.147 2.147 2.146-2.147a.5.5 0 1 1 .707.708L8.707 8l2.147 2.146a.5.5 0 0 1-.707.708L8 8.707l-2.146 2.147a.5.5 0 0 1-.707-.708L7.293 8 5.328 5.292z"/></svg>
+                                        <strong>Agent down:</strong> Not seen for > 6x heartbeat interval (removed after 20x).
+                                    </li>
+                                </ul>
+                            </div>
+                            <div class="col-md-6">
+                                <h6 class="small text-uppercase text-muted fw-bold">Columns & Badges</h6>
+                                <ul class="list-unstyled small mb-0">
+                                    <li class="mb-1"><span class="badge bg-success me-1">OK</span> Configuration matches latest published version.</li>
+                                    <li class="mb-1"><span class="badge bg-warning text-dark me-1">Outdated</span> Configuration is older than latest published version.</li>
+                                    <li class="mb-1"><strong>Nginx PID:</strong> Process ID of the managed Nginx instance.</li>
+                                    <li class="mb-1"><strong>Config:</strong> Time when the current configuration was applied.</li>
+                                    <li><strong>Last Seen:</strong> Time of the last successful heartbeat received from agent.</li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Agent Status Card -->
+                <div class="card mb-4 border-success">
+                    <div class="card-header bg-success text-white d-flex justify-content-between align-items-center">
                         <div class="d-flex align-items-center gap-3">
-                            <h3 class="h5 mb-0">Deployment Status</h3>
-                            <a href="/?tab=status" class="btn btn-sm btn-light text-primary">⟳ Refresh</a>
+                            <h3 class="h5 mb-0">Agent Status</h3>
+                            <a href="/?tab=status" class="btn btn-sm btn-light text-success">⟳ Refresh</a>
                         </div>
                         <div class="d-flex gap-2">
-                            {% if status_ok_count > 0 %}<span class="badge bg-light text-success">{{ status_ok_count }} OK</span>{% endif %}
-                            {% if status_error_count > 0 %}<span class="badge bg-light text-danger">{{ status_error_count }} Error</span>{% endif %}
-                            {% if status_inactive_count > 0 %}<span class="badge bg-light text-secondary">{{ status_inactive_count }} Inactive</span>{% endif %}
+                            {% if agent_active_count > 0 %}<span class="badge bg-light text-success">{{ agent_active_count }} Active</span>{% endif %}
+                            {% if agent_warning_count > 0 %}<span class="badge bg-light text-warning text-dark">{{ agent_warning_count }} Warning</span>{% endif %}
+                            {% if agent_critical_count > 0 %}<span class="badge bg-light text-danger">{{ agent_critical_count }} Critical</span>{% endif %}
                         </div>
                     </div>
                     <div class="list-group list-group-flush">
-                        {% if host_statuses | length == 0 %}
+                        {% if agent_statuses | length == 0 %}
                             <div class="list-group-item text-center text-muted p-4">
-                                No deployment status found. Publish config to S3 to see status.
+                                No active agents found. Publish config to S3 or wait for agents to report.
                             </div>
                         {% else %}
-                            {% for status in host_statuses %}
-                            <div class="list-group-item list-group-item-action {% if status.status is starting_with("Inactive") %}status-inactive bg-light{% endif %}">
-                                <div class="d-flex w-100 justify-content-between align-items-center">
-                                    <div class="d-flex align-items-center gap-2">
-                                        {% if status.status == "OK" %}
-                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" class="bi bi-check-circle-fill text-success" viewBox="0 0 16 16">
-                                                <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/>
+                            {% for agent in agent_statuses %}
+                            <div class="list-group-item list-group-item-action">
+                                <div class="row align-items-center">
+                                    <!-- Left Column: Status & Hostname -->
+                                    <div class="col-md-4 d-flex align-items-center gap-2">
+                                        {% if agent.health == "Active" %}
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" class="bi bi-activity text-success flex-shrink-0" viewBox="0 0 16 16">
+                                                <path fill-rule="evenodd" d="M6 2a.5.5 0 0 1 .47.33L10 12.036l1.53-4.208A.5.5 0 0 1 12 7.5h3.5a.5.5 0 0 1 0 1h-3.15l-1.88 5.17a.5.5 0 0 1-.94 0L6 3.964 4.47 8.171A.5.5 0 0 1 4 8.5H.5a.5.5 0 0 1 0-1h3.15l1.88-5.17A.5.5 0 0 1 6 2Z"/>
                                             </svg>
-                                        {% elif status.status == "Error" %}
-                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" class="bi bi-x-circle-fill text-danger" viewBox="0 0 16 16">
-                                                <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM5.354 4.646a.5.5 0 1 0-.708.708L7.293 8l-2.647 2.646a.5.5 0 0 0 .708.708L8 8.707l2.646 2.647a.5.5 0 0 0 .708-.708L8.707 8l2.647-2.646a.5.5 0 0 0-.708-.708L8 7.293 5.354 4.646z"/>
+                                        {% elif agent.health == "Warning" %}
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" class="bi bi-exclamation-triangle-fill text-warning flex-shrink-0" viewBox="0 0 16 16">
+                                                <path d="M8.982 1.566a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767L8.982 1.566zM8 5c.535 0 .954.462.9.995l-.35 3.507a.552.552 0 0 1-1.1 0L7.1 5.995A.905.905 0 0 1 8 5zm.002 6a1 1 0 1 1 0 2 1 1 0 0 1 0-2z"/>
                                             </svg>
-                                        {% elif status.status == "Inactive_OK" %}
-                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" class="bi bi-check-circle-fill text-secondary" viewBox="0 0 16 16">
-                                                <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zm-3.97-3.03a.75.75 0 0 0-1.08.022L7.477 9.417 5.384 7.323a.75.75 0 0 0-1.06 1.06L6.97 11.03a.75.75 0 0 0 1.079-.02l3.992-4.99a.75.75 0 0 0-.01-1.05z"/>
-                                            </svg>
-                                        {% elif status.status == "Inactive_Error" %}
-                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" class="bi bi-x-circle-fill text-secondary" viewBox="0 0 16 16">
-                                                <path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM5.354 4.646a.5.5 0 1 0-.708.708L7.293 8l-2.647 2.646a.5.5 0 0 0 .708.708L8 8.707l2.646 2.647a.5.5 0 0 0 .708-.708L8.707 8l2.647-2.646a.5.5 0 0 0-.708-.708L8 7.293 5.354 4.646z"/>
+                                        {% else %}
+                                            <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" class="bi bi-x-octagon-fill text-danger flex-shrink-0" viewBox="0 0 16 16">
+                                                <path d="M11.46.146A.5.5 0 0 0 11.107 0H4.893a.5.5 0 0 0-.353.146L.146 4.54A.5.5 0 0 0 0 4.893v6.214a.5.5 0 0 0 .146.353l4.394 4.394a.5.5 0 0 0 .353.146h6.214a.5.5 0 0 0 .353-.146l4.394-4.394a.5.5 0 0 0 .146-.353V4.893a.5.5 0 0 0-.146-.353L11.46.146zm-6.132 5.146a.5.5 0 1 1 .707-.708l2.147 2.147 2.146-2.147a.5.5 0 1 1 .707.708L8.707 8l2.147 2.146a.5.5 0 0 1-.707.708L8 8.707l-2.146 2.147a.5.5 0 0 1-.707-.708L7.293 8 5.328 5.292z"/>
                                             </svg>
                                         {% endif %}
                                         
-                                        <strong>{{ status.hostname }}</strong>
-                                        
-                                        {% if status.status is starting_with("Inactive") %}
-                                            <span class="badge bg-secondary text-white" style="font-size: 0.7em;">Inactive (Old Config)</span>
-                                        {% endif %}
+                                        <div class="text-truncate">
+                                            <strong class="d-block text-truncate" title="{{ agent.hostname }}">{{ agent.hostname }}</strong>
+                                            <small class="text-muted">
+                                                {% if agent.health == "Active" %}
+                                                    <span class="text-success">● Agent OK</span>
+                                                {% elif agent.health == "Warning" %}
+                                                    <span class="text-warning">● Agent might be down</span>
+                                                {% else %}
+                                                    <span class="text-danger">● Agent down</span>
+                                                {% endif %}
+                                            </small>
+                                        </div>
                                     </div>
                                     
-                                    <div class="d-flex align-items-center gap-3">
-                                        {% if status.status is containing("Error") %}
+                                    <!-- Middle Column: PID & Config -->
+                                    <div class="col-md-4 d-none d-md-block border-start">
+                                        <div class="text-muted small">
+                                            Nginx PID: <strong>{% if agent.pid %}{{ agent.pid }}{% else %}N/A{% endif %}</strong>
+                                        </div>
+                                        <div class="text-muted small">
+                                            <div class="d-flex align-items-center gap-1">
+                                                <span>Config:</span>
+                                                {% if agent.config_version_ts %}
+                                                    <span class="local-time text-secondary" data-timestamp="{{ agent.config_version_ts }}"></span>
+                                                {% else %}
+                                                    <span class="text-secondary">Unknown</span>
+                                                {% endif %}
+                                            </div>
+                                            <div>
+                                                {% if agent.is_outdated %}
+                                                    <span class="badge bg-warning text-dark" title="This agent's configuration is older than the latest published version">Outdated</span>
+                                                {% else %}
+                                                    <span class="badge bg-success" title="This agent is running the latest configuration">OK</span>
+                                                {% endif %}
+                                            </div>
+                                        </div>
+                                    </div>
+                                    
+                                    <!-- Right Column: Actions & Last Seen -->
+                                    <div class="col-md-4 d-flex align-items-center justify-content-end gap-3">
+                                        {% if agent.health != "Active" and agent.details != "" %}
                                             <button type="button" class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#logModal-{{ loop.index0 }}">
-                                                View Error
+                                                Logs
                                             </button>
                                         {% endif %}
                                         
-                                        <small class="text-muted">{{ status.timestamp }}</small>
-                                        {% if status.status is starting_with("Inactive") %}
-                                        <form action="/delete_status" method="post" class="m-0" onsubmit="return confirm('Are you sure you want to remove the status for {{ status.hostname }}?');">
-                                            <input type="hidden" name="hostname" value="{{ status.hostname }}">
-                                            <button type="submit" class="btn btn-sm btn-outline-secondary py-0 px-2" title="Remove status file">&times;</button>
+                                        <div class="text-end">
+                                            <small class="d-block text-muted">Last Seen</small>
+                                            <small class="local-time" data-timestamp="{{ agent.last_seen }}"></small>
+                                        </div>
+                                        <form action="/delete_status" method="post" class="m-0" onsubmit="return confirm('Are you sure you want to remove the agent status for {{ agent.hostname }}?');">
+                                            <input type="hidden" name="hostname" value="{{ agent.hostname }}">
+                                            <button type="submit" class="btn btn-sm btn-outline-secondary py-0 px-2" title="Remove agent file">&times;</button>
                                         </form>
-                                        {% endif %}
                                     </div>
                                 </div>
-                                
-                                {# Modals moved to bottom of page to avoid opacity/z-index issues #}
                             </div>
                             {% endfor %}
                         {% endif %}
                     </div>
                 </div>
+                
+                <!-- Deployment Status Card REMOVED as requested -->
             </div>
         </div>
     </div>
 
     <!-- Modals -->
-    {% if host_statuses | length > 0 %}
-        {% for status in host_statuses %}
-            {% if status.status is containing("Error") %}
-            <!-- Terminal Modal for {{ status.hostname }} -->
+    {% if agent_statuses | length > 0 %}
+        {% for agent in agent_statuses %}
+            {% if agent.details != "" %}
+            <!-- Terminal Modal for {{ agent.hostname }} -->
             <div class="modal fade terminal-modal" id="logModal-{{ loop.index0 }}" tabindex="-1" aria-hidden="true">
                 <div class="modal-dialog modal-lg modal-dialog-centered">
                     <div class="modal-content">
                         <div class="modal-header">
-                            <h5 class="modal-title">nginx error logs found on {{ status.hostname }}</h5>
+                            <h5 class="modal-title">Agent Logs: {{ agent.hostname }}</h5>
                             <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
                         </div>
                         <div class="modal-body">
-                            <pre class="terminal-log">{{ status.details }}</pre>
+                            <pre class="terminal-log">{{ agent.details }}</pre>
                         </div>
                     </div>
                 </div>
@@ -408,6 +483,28 @@
                 }
             }
         }
+        
+        // Format timestamps to local time
+        document.addEventListener('DOMContentLoaded', () => {
+            document.querySelectorAll('.local-time').forEach(el => {
+                const ts = parseInt(el.dataset.timestamp);
+                if (ts) {
+                    // Format: YYYY-MM-DD HH:MM:SS
+                    const date = new Date(ts * 1000);
+                    
+                    const pad = (num) => num.toString().padStart(2, '0');
+                    const formatted = 
+                        date.getFullYear() + '-' + 
+                        pad(date.getMonth() + 1) + '-' + 
+                        pad(date.getDate()) + ' ' + 
+                        pad(date.getHours()) + ':' + 
+                        pad(date.getMinutes()) + ':' + 
+                        pad(date.getSeconds());
+                    
+                    el.innerText = formatted;
+                }
+            });
+        });
     </script>
 </body>
 </html>

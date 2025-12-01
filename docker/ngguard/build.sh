@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-VER=10
+VER=1.0
 cd ../..
 cargo build --release
 cd -

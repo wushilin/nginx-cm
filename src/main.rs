@@ -10,7 +10,6 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
-    collections::HashMap,
     env,
 };
 use tera::{Context, Tera};
@@ -19,9 +18,11 @@ use tracing::{info, error};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::primitives::ByteStream;
 use rust_embed::RustEmbed;
-use chrono::Local;
 use clap::Parser;
 use anyhow::{Context as AnyhowContext, Result};
+
+mod scheduled_tasks;
+use scheduled_tasks::{TaskRunner, TaskContext, CleanupStatusTask};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -86,6 +87,9 @@ struct AppConfig {
     nginx_binary_path: String,
     #[serde(default = "default_nginx_working_dir")]
     nginx_working_dir: String,
+
+    #[serde(default = "default_heartbeat_interval_minutes")]
+    heartbeat_interval_minutes: u64,
 }
 
 fn default_resolver() -> String {
@@ -94,7 +98,7 @@ fn default_resolver() -> String {
 
 fn default_user() -> String {
     "www-data".to_string()
-}
+    }
 
 fn default_stream_module_path() -> String {
     "modules/ngx_stream_module.so".to_string()
@@ -108,6 +112,10 @@ fn default_nginx_working_dir() -> String {
     "/tmp/nginx".to_string()
 }
 
+fn default_heartbeat_interval_minutes() -> u64 {
+    1
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -118,6 +126,7 @@ impl Default for AppConfig {
             
             nginx_binary_path: default_nginx_binary_path(),
             nginx_working_dir: default_nginx_working_dir(),
+            heartbeat_interval_minutes: default_heartbeat_interval_minutes(),
         }
     }
 }
@@ -139,18 +148,24 @@ struct AppState {
 }
 
 #[derive(Serialize, Debug)]
-struct HostStatus {
+struct AgentStatus {
     hostname: String,
-    status: String, // "OK", "Error", "Inactive_OK", "Inactive_Error"
-    timestamp: String,
-    details: String, // Empty for OK, error log lines for Error
+    last_seen: u64,
+    is_running: bool,
+    health: String, // "Active", "Warning", "Critical"
+    pid: Option<u32>,
+    config_version_ts: Option<u64>, // Epoch timestamp
+    details: String,
+    is_outdated: bool,
 }
 
 #[derive(Deserialize, Serialize)]
 struct StatusReport {
-    success: bool,
+    is_nginx_running: bool,
+    nginx_pid: Option<u32>,
+    config_version: Option<u64>,
     timestamp: u64,
-    last_100_error_logs: String,
+    last_error_log: String,
     #[serde(default)]
     stdout: String,
     #[serde(default)]
@@ -199,6 +214,7 @@ struct UpdateNginxConfigForm {
 struct UpdateGuardianConfigForm {
     nginx_binary_path: String,
     nginx_working_dir: String,
+    heartbeat_interval_minutes: u64,
 }
 
 #[derive(Deserialize)]
@@ -312,6 +328,16 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     
     let args = Args::parse();
+
+    if let Ok(cwd) = env::var("CM_WORKING_DIR") {
+        info!("Changing working directory to: {}", cwd);
+        if let Err(e) = env::set_current_dir(&cwd) {
+            error!("Failed to set working directory to {}: {}", cwd, e);
+            // We might want to exit here if it's critical, but for now let's just log
+            anyhow::bail!("Failed to set working directory to {}: {}", cwd, e);
+        }
+    }
+
     let config_path = PathBuf::from("app_config.json");
     
     let s3_config = load_s3_config(args.config)?;
@@ -370,6 +396,17 @@ async fn main() -> anyhow::Result<()> {
     // Verify S3 access before starting
     verify_s3_access(&s3_config).await?;
 
+    // Start Scheduled Tasks
+    let task_context = TaskContext {
+        s3_config: s3_config.clone(),
+        heartbeat_interval_minutes: config.heartbeat_interval_minutes,
+    };
+    let mut task_runner = TaskRunner::new(task_context);
+    task_runner.add_task(CleanupStatusTask);
+    tokio::spawn(async move {
+        task_runner.start().await;
+    });
+
     let mut tera = Tera::default();
     // Load templates from embedded assets
     for file in Asset::iter() {
@@ -406,7 +443,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn fetch_statuses(config: &S3Config) -> Vec<HostStatus> {
+async fn fetch_statuses(config: &S3Config, heartbeat_interval_minutes: u64) -> Vec<AgentStatus> {
     if config.s3_bucket.is_empty() {
         return vec![];
     }
@@ -421,13 +458,12 @@ async fn fetch_statuses(config: &S3Config) -> Vec<HostStatus> {
         format!("{}/nginx.conf", folder)
     };
 
-    let conf_obj = match client.head_object().bucket(&config.s3_bucket).key(&conf_key).send().await {
-        Ok(output) => output,
-        Err(_) => return vec![], // Config doesn't exist or error accessing it
+    // Fetch nginx.conf metadata to check last modified time
+    let published_config_ts = match client.head_object().bucket(&config.s3_bucket).key(&conf_key).send().await {
+        Ok(resp) => resp.last_modified.map(|t| t.secs() as u64).unwrap_or(0),
+        Err(_) => 0,
     };
     
-    let conf_last_modified = conf_obj.last_modified.unwrap();
-
     // 2. List objects in folder
     let prefix = if folder.is_empty() {
         "".to_string()
@@ -441,13 +477,24 @@ async fn fetch_statuses(config: &S3Config) -> Vec<HostStatus> {
         key: String,
     }
 
-    let mut entries = Vec::new();
+    let mut status_entries = Vec::new();
     
     let mut paginator = client.list_objects_v2()
         .bucket(&config.s3_bucket)
         .prefix(&prefix)
         .into_paginator()
         .send();
+
+    let current_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Thresholds
+    let interval_secs = heartbeat_interval_minutes * 60;
+    let warning_threshold = 3 * interval_secs;
+    let critical_threshold = 6 * interval_secs;
+    // remove_threshold used in scheduled tasks now
 
     while let Some(page) = paginator.next().await {
         if let Ok(output) = page {
@@ -457,118 +504,107 @@ async fn fetch_statuses(config: &S3Config) -> Vec<HostStatus> {
 
                 let last_modified = obj.last_modified.unwrap();
                 
+                // Handle legacy .live files - delete them
+                if key.ends_with(".live") {
+                    // Legacy cleanup moved to scheduled_tasks.rs
+                    continue;
+                }
+                
                 if key.ends_with(".status") {
+                    // Cleanup logic moved to scheduled_tasks.rs
+                    // We just read here
                     let filename = key.strip_prefix(&prefix).unwrap_or(key);
                     let hostname = filename.strip_suffix(".status").unwrap_or(filename);
-                    entries.push(StatusEntry {
+                    status_entries.push(StatusEntry {
                         hostname: hostname.to_string(),
                         last_modified,
                         key: key.to_string(),
                     });
-                } else if key.ends_with(".loaded_ok") {
-                    let filename = key.strip_prefix(&prefix).unwrap_or(key);
-                    let hostname = filename.strip_suffix(".loaded_ok").unwrap_or(filename);
-                    entries.push(StatusEntry {
-                        hostname: hostname.to_string(),
-                        last_modified,
-                        key: key.to_string(),
-                    });
-                } else if key.ends_with(".loaded_error") {
-                    let filename = key.strip_prefix(&prefix).unwrap_or(key);
-                    let hostname = filename.strip_suffix(".loaded_error").unwrap_or(filename);
-                    entries.push(StatusEntry {
-                        hostname: hostname.to_string(),
-                        last_modified,
-                        key: key.to_string(),
-                    });
+                } 
+                // Handle legacy loaded_ok/error - delete them
+                else if key.ends_with(".loaded_ok") || key.ends_with(".loaded_error") {
+                    // Legacy cleanup also moved to scheduled_tasks.rs
                 }
             }
         }
     }
 
-    // Group by hostname
-    let mut host_map: HashMap<String, Vec<StatusEntry>> = HashMap::new();
-    for entry in entries {
-        host_map.entry(entry.hostname.clone()).or_default().push(entry);
-    }
+    // Process Statuses
+    let mut agent_statuses = Vec::new();
 
-    let mut statuses = Vec::new();
+    for entry in status_entries {
+        let last_modified_secs = entry.last_modified.secs() as u64;
+        let diff = if current_time > last_modified_secs { current_time - last_modified_secs } else { 0 };
+        
+        let health = if diff < warning_threshold { 
+            "Active".to_string()
+        } else if diff < critical_threshold { 
+            "Warning".to_string()
+        } else {
+            "Critical".to_string()
+        };
 
-    for (hostname, entries) in host_map {
-        // Find entry with latest timestamp
-        if let Some(best_entry) = entries.iter().max_by_key(|e| e.last_modified) {
-            let is_active = best_entry.last_modified.as_nanos() > conf_last_modified.as_nanos();
-            
-            let mut status_str = String::new();
-            let mut details = "".to_string();
+        let mut is_running = false;
+        let mut pid = None;
+        let mut config_version_ts = None;
+        let mut details = "".to_string();
+        let mut is_outdated = false;
 
-            // Fetch content to parse JSON or get legacy content
-            if let Ok(get_obj) = client.get_object().bucket(&config.s3_bucket).key(&best_entry.key).send().await {
-                if let Ok(bytes) = get_obj.body.collect().await {
-                    let content = String::from_utf8_lossy(&bytes.into_bytes()).to_string();
+        // Fetch content
+        if let Ok(get_obj) = client.get_object().bucket(&config.s3_bucket).key(&entry.key).send().await {
+            if let Ok(bytes) = get_obj.body.collect().await {
+                let content = String::from_utf8_lossy(&bytes.into_bytes()).to_string();
+                if let Ok(report) = serde_json::from_str::<StatusReport>(&content) {
+                    is_running = report.is_nginx_running;
+                    pid = report.nginx_pid;
+                    config_version_ts = report.config_version;
                     
-                    if best_entry.key.ends_with(".status") {
-                        if let Ok(report) = serde_json::from_str::<StatusReport>(&content) {
-                            status_str = if report.success {
-                                if is_active { "OK".to_string() } else { "Inactive_OK".to_string() }
-                            } else {
-                                if is_active { "Error".to_string() } else { "Inactive_Error".to_string() }
-                            };
-                            // Combine logs
-                            let mut parts = Vec::new();
-                            if !report.last_100_error_logs.is_empty() {
-                                parts.push(format!("=== Nginx Error Log ===\n{}", report.last_100_error_logs));
-                            }
-                            if !report.stderr.is_empty() {
-                                parts.push(format!("=== Stderr ===\n{}", report.stderr));
-                            }
-                            if !report.stdout.is_empty() {
-                                parts.push(format!("=== Stdout ===\n{}", report.stdout));
-                            }
-                            details = parts.join("\n\n");
-                        } else {
-                            // Fallback for bad JSON
-                            status_str = if is_active { "Error".to_string() } else { "Inactive_Error".to_string() };
-                            details = format!("Invalid status report format: {}", content);
+                    if let Some(ts) = report.config_version {
+                        // Check if outdated
+                        if ts < published_config_ts {
+                            is_outdated = true;
                         }
                     } else {
-                        // Legacy support
-                        if best_entry.key.ends_with(".loaded_ok") {
-                            status_str = if is_active { "OK".to_string() } else { "Inactive_OK".to_string() };
-                        } else {
-                            status_str = if is_active { "Error".to_string() } else { "Inactive_Error".to_string() };
-                            details = content;
+                        // No config version means definitely outdated if we have a published config
+                        if published_config_ts > 0 {
+                            is_outdated = true;
                         }
                     }
+
+                    // Combine logs if error
+                    let mut parts = Vec::new();
+                    if !report.last_error_log.is_empty() {
+                        parts.push(format!("=== Nginx Error Log ===\n{}", report.last_error_log));
+                    }
+                    if !report.stderr.is_empty() {
+                        parts.push(format!("=== Stderr ===\n{}", report.stderr));
+                    }
+                    if !report.stdout.is_empty() {
+                        parts.push(format!("=== Stdout ===\n{}", report.stdout));
+                    }
+                    details = parts.join("\n\n");
                 }
             }
-
-            if status_str.is_empty() {
-                status_str = "Unknown".to_string();
-            }
-
-            // Convert timestamp to local time string
-            let secs = best_entry.last_modified.secs();
-            let nanos = best_entry.last_modified.subsec_nanos();
-            
-            let timestamp_str = if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
-                let local_dt: chrono::DateTime<Local> = chrono::DateTime::from(dt);
-                local_dt.format("%Y-%m-%d %H:%M:%S %Z").to_string()
-            } else {
-                best_entry.last_modified.to_string()
-            };
-
-            statuses.push(HostStatus {
-                hostname,
-                status: status_str,
-                timestamp: timestamp_str,
-                details,
-            });
         }
+
+        agent_statuses.push(AgentStatus {
+            hostname: entry.hostname.clone(),
+            last_seen: last_modified_secs,
+            is_running,
+            health,
+            pid,
+            config_version_ts,
+            details,
+            is_outdated,
+        });
     }
     
-    statuses.sort_by(|a, b| a.hostname.cmp(&b.hostname));
-    statuses
+    // Sorting Agent Status: Newest First
+    agent_statuses.sort_by(|a, b| {
+        b.last_seen.cmp(&a.last_seen)
+    });
+
+    agent_statuses
 }
 
 async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -584,24 +620,26 @@ async fn index(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     
     context.insert("nginx_binary_path", &config_clone.nginx_binary_path);
     context.insert("nginx_working_dir", &config_clone.nginx_working_dir);
+    context.insert("heartbeat_interval_minutes", &config_clone.heartbeat_interval_minutes);
 
     // Fetch statuses if S3 is configured
     if !s3_config.s3_bucket.is_empty() {
-        let statuses = fetch_statuses(s3_config).await;
-        context.insert("host_statuses", &statuses);
+        let agent_statuses = fetch_statuses(s3_config, config_clone.heartbeat_interval_minutes).await;
+        context.insert("agent_statuses", &agent_statuses);
         
-        let ok_count = statuses.iter().filter(|s| s.status == "OK").count();
-        let error_count = statuses.iter().filter(|s| s.status == "Error").count();
-        let inactive_count = statuses.iter().filter(|s| s.status.starts_with("Inactive")).count();
+        let agent_active = agent_statuses.iter().filter(|s| s.health == "Active").count();
+        let agent_warn = agent_statuses.iter().filter(|s| s.health == "Warning").count();
+        let agent_crit = agent_statuses.iter().filter(|s| s.health == "Critical").count();
         
-        context.insert("status_ok_count", &ok_count);
-        context.insert("status_error_count", &error_count);
-        context.insert("status_inactive_count", &inactive_count);
+        context.insert("agent_active_count", &agent_active);
+        context.insert("agent_warning_count", &agent_warn);
+        context.insert("agent_critical_count", &agent_crit);
+
     } else {
-        context.insert("host_statuses", &Vec::<HostStatus>::new());
-        context.insert("status_ok_count", &0);
-        context.insert("status_error_count", &0);
-        context.insert("status_inactive_count", &0);
+        context.insert("agent_statuses", &Vec::<AgentStatus>::new());
+        context.insert("agent_active_count", &0);
+        context.insert("agent_warning_count", &0);
+        context.insert("agent_critical_count", &0);
     }
 
     // Generate preview
@@ -709,6 +747,7 @@ async fn update_guardian_config(
         let mut config = state.config.lock().unwrap();
         config.nginx_binary_path = form.nginx_binary_path;
         config.nginx_working_dir = form.nginx_working_dir;
+        config.heartbeat_interval_minutes = form.heartbeat_interval_minutes;
         
         save_config(&config, &state.config_path);
     }
@@ -760,6 +799,7 @@ async fn apply_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let trimmed_config = serde_json::json!({
         "nginx_binary_path": config.nginx_binary_path,
         "nginx_working_dir": config.nginx_working_dir,
+        "heartbeat_interval_minutes": config.heartbeat_interval_minutes,
     });
     
     if let Ok(json_bytes) = serde_json::to_vec_pretty(&trimmed_config) {
@@ -826,13 +866,13 @@ async fn delete_status(
     let status_key = format!("{}{}.status", prefix, form.hostname);
     let _ = client.delete_object().bucket(&s3_config.s3_bucket).key(status_key).send().await;
 
-    // Try deleting legacy .loaded_ok
+    // Clean up legacy files just in case
     let ok_key = format!("{}{}.loaded_ok", prefix, form.hostname);
     let _ = client.delete_object().bucket(&s3_config.s3_bucket).key(ok_key).send().await;
-
-    // Try deleting legacy .loaded_error
     let error_key = format!("{}{}.loaded_error", prefix, form.hostname);
     let _ = client.delete_object().bucket(&s3_config.s3_bucket).key(error_key).send().await;
+    let live_key = format!("{}{}.live", prefix, form.hostname);
+    let _ = client.delete_object().bucket(&s3_config.s3_bucket).key(live_key).send().await;
 
     Redirect::to("/?tab=status")
 }

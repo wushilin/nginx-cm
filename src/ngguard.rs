@@ -26,6 +26,12 @@ struct AppSettings {
     nginx_binary_path: String,
     nginx_working_dir: String,
     // nginx_conf_download_path removed, derived from working_dir
+    #[serde(default = "default_heartbeat_interval")]
+    heartbeat_interval_minutes: u64,
+}
+
+fn default_heartbeat_interval() -> u64 {
+    1
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -136,12 +142,25 @@ impl GuardConfig {
         
         let app_json: serde_json::Value = serde_json::from_str(&app_content)?;
         
+        // Override interval from env if set, otherwise use json, otherwise default
+        let env_interval = env::var("HEARTBEAT_INTERVAL_MINUTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+
+        let interval = if let Some(v) = env_interval {
+            v
+        } else {
+            app_json["heartbeat_interval_minutes"].as_u64().unwrap_or(1)
+        };
+
         let app = AppSettings {
             nginx_binary_path: app_json["nginx_binary_path"].as_str().unwrap_or("/usr/sbin/nginx").to_string(),
             nginx_working_dir: app_json["nginx_working_dir"].as_str().unwrap_or("/etc/nginx").to_string(),
+            heartbeat_interval_minutes: interval,
         };
 
         info!("Loaded app settings: nginx_binary={}", app.nginx_binary_path);
+        info!("Heartbeat Interval: {} minutes", app.heartbeat_interval_minutes);
 
         Ok(GuardConfig { app, s3 })
     }
@@ -149,9 +168,11 @@ impl GuardConfig {
 
 #[derive(Serialize)]
 struct StatusReport {
-    success: bool,
+    is_nginx_running: bool,
+    nginx_pid: Option<u32>,
+    config_version: Option<u64>,
     timestamp: u64,
-    last_100_error_logs: String,
+    last_error_log: String,
     stdout: String,
     stderr: String,
 }
@@ -244,6 +265,9 @@ struct NginxManager {
     
     stdout_buffer: Arc<Mutex<String>>,
     stderr_buffer: Arc<Mutex<String>>,
+
+    last_successful_heartbeat: std::time::Instant,
+    current_config_modified: Option<u64>,
 }
 
 impl NginxManager {
@@ -289,6 +313,9 @@ impl NginxManager {
             aws_sdk_s3::Client::new(&sdk_config)
         };
 
+        // Initialize last_successful_heartbeat so it reports immediately
+        let last_successful_heartbeat = std::time::Instant::now().checked_sub(Duration::from_secs(3600)).unwrap_or(std::time::Instant::now());
+
         Ok(Self {
             child: None,
             config,
@@ -301,6 +328,8 @@ impl NginxManager {
             last_app_config_etag: None,
             stdout_buffer: Arc::new(Mutex::new(String::new())),
             stderr_buffer: Arc::new(Mutex::new(String::new())),
+            last_successful_heartbeat,
+            current_config_modified: None,
         })
     }
 
@@ -308,7 +337,7 @@ impl NginxManager {
         PathBuf::from(&self.config.app.nginx_working_dir).join("error.log")
     }
 
-    async fn upload_status(&self, success: bool, content: Option<String>) -> Result<()> {
+    async fn upload_status(&self, is_running: bool, pid: Option<u32>, error_content: Option<String>) -> Result<()> {
         let folder = self.config.s3.s3_folder.trim_end_matches('/');
         let prefix = if folder.is_empty() {
             "".to_string()
@@ -325,9 +354,11 @@ impl NginxManager {
         let stderr_content = self.stderr_buffer.lock().unwrap().clone();
 
         let report = StatusReport {
-            success,
+            is_nginx_running: is_running,
+            nginx_pid: pid,
+            config_version: self.current_config_modified,
             timestamp,
-            last_100_error_logs: content.unwrap_or_default(),
+            last_error_log: error_content.unwrap_or_default(),
             stdout: stdout_content,
             stderr: stderr_content,
         };
@@ -342,11 +373,14 @@ impl NginxManager {
             .send()
             .await?;
 
-        // Clean up old status files if they exist (legacy cleanup)
+        // Clean up old legacy status files
         let old_ok_key = format!("{}{}.loaded_ok", prefix, self.hostname);
         let _ = self.client.delete_object().bucket(&self.config.s3.s3_bucket).key(&old_ok_key).send().await;
         let old_err_key = format!("{}{}.loaded_error", prefix, self.hostname);
         let _ = self.client.delete_object().bucket(&self.config.s3.s3_bucket).key(&old_err_key).send().await;
+        // Clean up old liveness file
+        let old_live_key = format!("{}{}.live", prefix, self.hostname);
+        let _ = self.client.delete_object().bucket(&self.config.s3.s3_bucket).key(&old_live_key).send().await;
 
         Ok(())
     }
@@ -394,15 +428,28 @@ impl NginxManager {
                         if let Ok(app_content) = String::from_utf8(bytes.into_bytes().to_vec()) {
                             if let Ok(app_json) = serde_json::from_str::<serde_json::Value>(&app_content) {
                                 // Update config
+                                
+                                // Also check for env override on update
+                                let env_interval = env::var("HEARTBEAT_INTERVAL_MINUTES")
+                                    .ok()
+                                    .and_then(|v| v.parse::<u64>().ok());
+
+                                let interval = if let Some(v) = env_interval {
+                                    v
+                                } else {
+                                    app_json["heartbeat_interval_minutes"].as_u64().unwrap_or(1)
+                                };
+                                
                                 self.config.app = AppSettings {
                                     nginx_binary_path: app_json["nginx_binary_path"].as_str().unwrap_or("/usr/sbin/nginx").to_string(),
                                     nginx_working_dir: app_json["nginx_working_dir"].as_str().unwrap_or("/etc/nginx").to_string(),
+                                    heartbeat_interval_minutes: interval,
                                 };
                                 
                                 self.last_app_config_timestamp = Some(last_modified);
                                 self.last_app_config_etag = Some(etag);
                                 restart_required = true;
-                                info!("App config updated successfully.");
+                                info!("App config updated successfully. Heartbeat interval: {} min", self.config.app.heartbeat_interval_minutes);
                             } else {
                                 error!("Failed to parse ngguard.json");
                             }
@@ -446,6 +493,9 @@ impl NginxManager {
                 if last_modified.as_nanos() == failed_ts.as_nanos() {
                     info!("Skipping known bad config (Timestamp: {:?}). Waiting for update.", last_modified);
                     if !restart_required {
+                        // Check periodic status report
+                        let (is_running, pid) = self.get_process_status();
+                        self.check_and_send_heartbeat(is_running, pid).await?;
                         return Ok(());
                     }
                 }
@@ -488,7 +538,11 @@ impl NginxManager {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     let msg = format!("Failed to create directory {:?}: {}", parent, e);
                     error!("{}", msg);
-                    let _ = self.upload_status(false, Some(msg)).await;
+                    let _ = self.upload_status(false, None, Some(msg)).await;
+                    
+                    let (is_running, pid) = self.get_process_status();
+                    self.check_and_send_heartbeat(is_running, pid).await?;
+                    
                     return Err(e.into());
                 }
             }
@@ -496,7 +550,11 @@ impl NginxManager {
             if let Err(e) = std::fs::write(&config_path, data) {
                 let msg = format!("Failed to write config file {:?}: {}", config_path, e);
                 error!("{}", msg);
-                let _ = self.upload_status(false, Some(msg)).await;
+                let _ = self.upload_status(false, None, Some(msg)).await;
+                
+                let (is_running, pid) = self.get_process_status();
+                self.check_and_send_heartbeat(is_running, pid).await?;
+                
                 return Err(e.into());
             }
 
@@ -519,7 +577,10 @@ impl NginxManager {
                     Ok(content) => content.lines().rev().take(100).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"),
                     Err(_) => "Nginx died unexpectedly. Could not read error log.".to_string(),
                 };
-                let _ = self.upload_status(false, Some(error_log_content)).await;
+                let _ = self.upload_status(false, None, Some(error_log_content)).await;
+                // Successful heartbeat updated on forced upload
+                self.last_successful_heartbeat = std::time::Instant::now();
+                
                 true
             } else {
                 false // Running fine, config match
@@ -642,7 +703,11 @@ impl NginxManager {
             if success {
                 info!("Nginx successfully started and stable.");
                 self.child = Some(child);
-                self.upload_status(true, None).await?;
+                self.current_config_modified = Some(last_modified.secs() as u64);
+                
+                // We don't need logs if success
+                let _ = self.upload_status(true, Some(pid), None).await;
+                self.last_successful_heartbeat = std::time::Instant::now();
                 
                 // Update state on success
                 if config_changed {
@@ -663,15 +728,66 @@ impl NginxManager {
                     Err(e) => format!("Could not read error log from {:?}: {}", error_log_path, e),
                 };
 
-                self.upload_status(false, Some(error_log_content)).await?;
+                let _ = self.upload_status(false, None, Some(error_log_content)).await;
+                self.last_successful_heartbeat = std::time::Instant::now();
                 
                 if config_changed {
                     self.failed_config_timestamp = Some(last_modified);
                     error!("New configuration failed. Rollback is DISABLED as per configuration.");
                 }
             }
+        } else {
+            // If no restart was needed, check if we need to send a periodic status report
         }
+        
+        // Check and send heartbeat
+        let (is_running, pid) = self.get_process_status();
+        self.check_and_send_heartbeat(is_running, pid).await?;
 
+        Ok(())
+    }
+
+    fn get_process_status(&mut self) -> (bool, Option<u32>) {
+        if let Some(child) = &mut self.child {
+             match child.try_wait() {
+                 Ok(None) => (true, child.id()),
+                 _ => (false, None),
+             }
+        } else {
+            (false, None)
+        }
+    }
+
+    async fn check_and_send_heartbeat(&mut self, is_running: bool, pid: Option<u32>) -> Result<()> {
+        // Check every minute (called in main loop)
+        
+        let interval_secs = self.config.app.heartbeat_interval_minutes * 60;
+        
+        // If it has been more than the configured interval since last successful heartbeat, try to send
+        if self.last_successful_heartbeat.elapsed() > Duration::from_secs(interval_secs) {
+            info!("Sending periodic status heartbeat ({}s elapsed)", interval_secs);
+            
+            // For periodic heartbeat, only send logs if NOT running
+            let error_content = if !is_running {
+                let error_log_path = self.get_error_log_path();
+                match std::fs::read_to_string(&error_log_path) {
+                    Ok(content) => Some(content.lines().rev().take(100).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")),
+                    Err(_) => None
+                }
+            } else {
+                None
+            };
+
+            match self.upload_status(is_running, pid, error_content).await {
+                Ok(_) => {
+                    self.last_successful_heartbeat = std::time::Instant::now();
+                },
+                Err(e) => {
+                    error!("Failed to send heartbeat status: {}", e);
+                    // Do NOT update last_successful_heartbeat, so it will retry next loop (10s later)
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -705,10 +821,10 @@ async fn main() -> Result<()> {
     if let Err(e) = manager.check_and_reload().await {
         error!("Error in initial check: {}", e);
         // Upload initial error status if something critical failed early
-        let _ = manager.upload_status(false, Some(format!("Critical ngguard error: {}", e))).await;
+        let _ = manager.upload_status(false, None, Some(format!("Critical ngguard error: {}", e))).await;
     }
 
-    let mut interval = time::interval(Duration::from_secs(10));
+    let mut interval = time::interval(Duration::from_secs(10)); // Main loop ticks every 10s
     loop {
         interval.tick().await;
         if let Err(e) = manager.check_and_reload().await {
